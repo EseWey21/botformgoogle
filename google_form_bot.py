@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google Forms bot con Playwright (Python) — visible y sin capturas
-- Chromium visible por defecto (headful) + slowmo para observar los clicks.
+Google Forms bot con Playwright (Python) — visible, sin capturas y con múltiples envíos
+- Chromium visible por defecto (headful) + slowmo para observar los clics.
 - Genera respuestas según distribuciones embebidas (aprox. del Excel), con variación.
 - En checkbox selecciona >= 2 opciones (cuando aplique) y maneja exclusivas.
+- Repite el llenado/enviado N veces (por defecto 30) en un mismo navegador,
+  creando un contexto/pestaña nueva por ejecución para aislar la sesión.
 
 Requisitos:
   pip install playwright
   playwright install chromium
 
 Ejemplos:
-  python google_form_bot.py --url "https://docs.google.com/forms/d/e/.../viewform"
-  python google_form_bot.py --url "..." --headless         # si lo quieres oculto
-  python google_form_bot.py --url "..." --slowmo 80        # ajusta velocidad
+  python google_form_bot.py --url "https://docs.google.com/forms/d/e/.../viewform" --runs 30
+  python google_form_bot.py --url "..." --headless --runs 5
+  python google_form_bot.py --url "..." --slowmo 80 --runs 10
 """
 import argparse
 import json
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Sequence, Optional, Tuple
+from typing import Dict, List, Any, Sequence, Tuple
 
 from playwright.sync_api import sync_playwright, Page, Locator
 
@@ -109,10 +111,8 @@ def select_linear_scale_permutation(page: Page, group_title: str):
         col_index = columns[i % col_count]
         row = rows.nth(i)
         row.scroll_into_view_if_needed(timeout=5000)
-        target_radio = row.get_by_role("radio").nth(col_index)
-        target_radio.click(timeout=15000)
+        row.get_by_role("radio").nth(col_index).click(timeout=15000)
         time.sleep(0.12)
-
     wait_idle(page)
 
 def select_linear_scale_from_dict(page: Page, group_title: str, rows_to_values: Dict[str, int]):
@@ -125,17 +125,13 @@ def select_linear_scale_from_dict(page: Page, group_title: str, rows_to_values: 
             has=group.get_by_text(row_text, exact=False)
         ).first
         if row.count() == 0:
-            row = group.locator('div').filter(
-                has=group.get_by_text(row_text, exact=False)
-            ).first
+            row = group.locator('div').filter(has=group.get_by_text(row_text, exact=False)).first
         row.scroll_into_view_if_needed(timeout=5000)
-
         radios = row.get_by_role("radio")
         col_count = radios.count()
         idx = max(0, min(value - 1, col_count - 1))
         radios.nth(idx).click(timeout=15000)
         time.sleep(0.12)
-
     wait_idle(page)
 
 # ============================================================
@@ -164,27 +160,13 @@ OPTS = {
 
 WEIGHTS: Dict[str, Dict[str, float]] = {
     "semestre": {
-        "6 - 9": 0.60,
-        "10 - 15": 0.18,
-        "1 - 3": 0.10,
-        "4 - 5": 0.08,
-        "Egresado / Profesional": 0.04,
+        "6 - 9": 0.60, "10 - 15": 0.18, "1 - 3": 0.10, "4 - 5": 0.08, "Egresado / Profesional": 0.04,
     },
     "herramientas": {
-        "Matlab": 0.35,
-        "Packet Tracer": 0.23,
-        "Wireshark": 0.19,
-        "GNS3": 0.04,
-        "Snort": 0.04,
-        "EVE-NG": 0.02,
-        "Ninguno": 0.03,
+        "Matlab": 0.35, "Packet Tracer": 0.23, "Wireshark": 0.19, "GNS3": 0.04, "Snort": 0.04, "EVE-NG": 0.02, "Ninguno": 0.03,
     },
     "so_virtualizados_main": {
-        "Ubuntu LTS (Desktop/Server)": 0.35,
-        "Kali Linux": 0.25,
-        "Debian": 0.15,
-        "Windows Server 2019/2022": 0.20,
-        "pfSense (firewall/router)": 0.05,
+        "Ubuntu LTS (Desktop/Server)": 0.35, "Kali Linux": 0.25, "Debian": 0.15, "Windows Server 2019/2022": 0.20, "pfSense (firewall/router)": 0.05,
     },
     "impedimentos_main": {
         "Bajo rendimiento del equipo (CPU/RAM/disco; el programa se congela o va lento)": 0.35,
@@ -193,10 +175,7 @@ WEIGHTS: Dict[str, Dict[str, float]] = {
         "Virtualización/Docker/WSL no funcionan (VT-x/AMD-V desactivado, errores de arranque)": 0.10,
         "Restricciones de red/seguridad (antivirus, firewall, VPN o internet inestable)": 0.10,
     },
-    "tipo_equipo": {
-        "Laptop (Portátil)": 0.80,
-        "Computadora de escritorio (Desktop)": 0.20,
-    },
+    "tipo_equipo": {"Laptop (Portátil)": 0.80, "Computadora de escritorio (Desktop)": 0.20},
     "cpu": {"Intel": 0.75, "AMD": 0.18, "Apple (Serie M)": 0.07},
     "ram": {"4GB o menos": 0.15, "8 GB": 0.40, "16 GB": 0.35, "32 GB o más": 0.10},
     "tipo_almacenamiento": {"Disco de Estado Sólido (SSD)": 0.80, "Disco duro Mecánico (HDD)": 0.15, "Híbrido (SSD + HDD)": 0.05},
@@ -297,86 +276,111 @@ def build_prob_answers() -> Dict[str, Any]:
     return {"page1": page1, "page2": page2, "page3": page3}
 
 # ============================================================
-# Runner
+# Relleno y envío (una ejecución)
 # ============================================================
 
-def run_bot(url: str, answers: Dict[str, Any], headless: bool = False, slowmo: int = 120):
+def _fill_and_submit(page: Page, answers: Dict[str, Any]):
+    page.goto(url=answers["_url"], wait_until="domcontentloaded")
+    wait_idle(page)
+
+    # === PAGE 1 ===
+    p1 = answers.get("page1", {})
+    if p1:
+        if "semestre" in p1:
+            select_radio(page, "¿En qué semestre te encuentras?", p1["semestre"])
+
+        if "herramientas" in p1 and isinstance(p1["herramientas"], list):
+            select_checkboxes(page, "¿Qué herramientas usas hoy para prácticas?", p1["herramientas"])
+
+        if "so_virtualizados" in p1 and isinstance(p1["so_virtualizados"], list):
+            select_checkboxes(page, "¿Qué sistemas operativos virtualizas en tu equipo personal?", p1["so_virtualizados"])
+
+        if "impedimentos" in p1 and isinstance(p1["impedimentos"], list):
+            select_checkboxes(page, "¿qué es lo que falla o te impide usarlos correctamente en tu equipo personal?", p1["impedimentos"])
+
+    click_next(page, "Siguiente")
+
+    # === PAGE 2 ===
+    p2 = answers.get("page2", {})
+    if p2:
+        if "tipo_equipo" in p2:
+            select_radio(page, "¿Qué tipo de equipo utilizar", p2["tipo_equipo"])
+
+        if "cpu" in p2:
+            select_radio(page, "¿Con qué procesador cuenta tu equipo", p2["cpu"])
+
+        if "ram" in p2:
+            select_radio(page, "¿Con cuánta memoria RAM", p2["ram"])
+
+        if "tipo_almacenamiento" in p2:
+            select_radio(page, "¿Cuál es el tipo de almacenamiento principal", p2["tipo_almacenamiento"])
+
+        if "capacidad_almacenamiento" in p2:
+            select_radio(page, "¿Cuál es la capacidad total de memoria principal aproximada", p2["capacidad_almacenamiento"])
+
+        if "gpu" in p2:
+            select_radio(page, "¿Con qué tipo de gráficos cuenta tu equipo principal", p2["gpu"])
+
+    click_next(page, "Siguiente")
+
+    # === PAGE 3 ===
+    p3 = answers.get("page3", {})
+    if p3:
+        if "preferencia" in p3:
+            select_radio(page, "¿Prefieres utilizar un servicio", p3["preferencia"])
+
+        if p3.get("beneficios_permutar", True):
+            select_linear_scale_permutation(page, "¿Qué beneficios considera más importantes")
+        else:
+            if isinstance(p3.get("beneficios"), dict):
+                select_linear_scale_from_dict(page, "¿Qué beneficios considera más importantes", p3["beneficios"])
+            else:
+                select_linear_scale_permutation(page, "¿Qué beneficios considera más importantes")
+
+        if p3.get("preocupaciones_permutar", True):
+            select_linear_scale_permutation(page, "¿Qué preocupaciones le genera el uso")
+        else:
+            if isinstance(p3.get("preocupaciones"), dict):
+                select_linear_scale_from_dict(page, "¿Qué preocupaciones le genera el uso", p3["preocupaciones"])
+            else:
+                select_linear_scale_permutation(page, "¿Qué preocupaciones le genera el uso")
+
+    click_submit(page, "Enviar")
+    wait_idle(page)
+
+# ============================================================
+# Runner múltiples ejecuciones en un mismo navegador
+# ============================================================
+
+def run_many(url: str, runs: int = 110, headless: bool = False, slowmo: int = 120, answers_static: Dict[str, Any] | None = None, jitter_s: float = 0.8):
     """
-    headless=False por defecto para ver Chromium; slowmo para observar el llenado.
+    - Abre un navegador.
+    - Repite 'runs' veces creando un contexto/pestaña nuevo.
+    - Si 'answers_static' es None, genera nuevas respuestas en cada vuelta.
+    - 'jitter_s' añade un pequeño sleep aleatorio entre iteraciones.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, slow_mo=slowmo)
-        ctx = browser.new_context(viewport={"width": 1440, "height": 900})
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        wait_idle(page)
-
-        # === PAGE 1 ===
-        p1 = answers.get("page1", {})
-        if p1:
-            if "semestre" in p1:
-                select_radio(page, "¿En qué semestre te encuentras?", p1["semestre"])
-
-            if "herramientas" in p1 and isinstance(p1["herramientas"], list):
-                select_checkboxes(page, "¿Qué herramientas usas hoy para prácticas?", p1["herramientas"])
-
-            if "so_virtualizados" in p1 and isinstance(p1["so_virtualizados"], list):
-                select_checkboxes(page, "¿Qué sistemas operativos virtualizas en tu equipo personal?", p1["so_virtualizados"])
-
-            if "impedimentos" in p1 and isinstance(p1["impedimentos"], list):
-                select_checkboxes(page, "¿qué es lo que falla o te impide usarlos correctamente en tu equipo personal?", p1["impedimentos"])
-
-        click_next(page, "Siguiente")
-
-        # === PAGE 2 ===
-        p2 = answers.get("page2", {})
-        if p2:
-            if "tipo_equipo" in p2:
-                select_radio(page, "¿Qué tipo de equipo utilizar", p2["tipo_equipo"])
-
-            if "cpu" in p2:
-                select_radio(page, "¿Con qué procesador cuenta tu equipo", p2["cpu"])
-
-            if "ram" in p2:
-                select_radio(page, "¿Con cuánta memoria RAM", p2["ram"])
-
-            if "tipo_almacenamiento" in p2:
-                select_radio(page, "¿Cuál es el tipo de almacenamiento principal", p2["tipo_almacenamiento"])
-
-            if "capacidad_almacenamiento" in p2:
-                select_radio(page, "¿Cuál es la capacidad total de memoria principal aproximada", p2["capacidad_almacenamiento"])
-
-            if "gpu" in p2:
-                select_radio(page, "¿Con qué tipo de gráficos cuenta tu equipo principal", p2["gpu"])
-
-        click_next(page, "Siguiente")
-
-        # === PAGE 3 ===
-        p3 = answers.get("page3", {})
-        if p3:
-            if "preferencia" in p3:
-                select_radio(page, "¿Prefieres utilizar un servicio", p3["preferencia"])
-
-            if p3.get("beneficios_permutar", True):
-                select_linear_scale_permutation(page, "¿Qué beneficios considera más importantes")
-            else:
-                if isinstance(p3.get("beneficios"), dict):
-                    select_linear_scale_from_dict(page, "¿Qué beneficios considera más importantes", p3["beneficios"])
+        for i in range(1, runs + 1):
+            ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = ctx.new_page()
+            try:
+                if answers_static is None:
+                    answers = build_prob_answers()
                 else:
-                    select_linear_scale_permutation(page, "¿Qué beneficios considera más importantes")
+                    answers = json.loads(json.dumps(answers_static))  # deep copy simple
+                answers["_url"] = url
 
-            if p3.get("preocupaciones_permutar", True):
-                select_linear_scale_permutation(page, "¿Qué preocupaciones le genera el uso")
-            else:
-                if isinstance(p3.get("preocupaciones"), dict):
-                    select_linear_scale_from_dict(page, "¿Qué preocupaciones le genera el uso", p3["preocupaciones"])
-                else:
-                    select_linear_scale_permutation(page, "¿Qué preocupaciones le genera el uso")
-
-        click_submit(page, "Enviar")
-        _log("Formulario enviado.")
-
-        ctx.close()
+                _log(f"Iteración {i}/{runs}: llenando y enviando…")
+                _fill_and_submit(page, answers)
+                _log(f"Iteración {i}/{runs}: enviada ✅")
+            except Exception as e:
+                _log(f"Iteración {i}/{runs}: ERROR -> {e}")
+            finally:
+                page.close()
+                ctx.close()
+                # pequeño respiro aleatorio para no spamear al servidor
+                time.sleep(random.uniform(0.2, jitter_s))
         browser.close()
 
 # ============================================================
@@ -384,12 +388,13 @@ def run_bot(url: str, answers: Dict[str, Any], headless: bool = False, slowmo: i
 # ============================================================
 
 def main():
-    ap = argparse.ArgumentParser(description="Google Forms bot visible y sin capturas.")
+    ap = argparse.ArgumentParser(description="Google Forms bot visible, sin capturas y con múltiples envíos.")
     ap.add_argument("--url", required=False, help="URL de vista del formulario (viewform)")
     ap.add_argument("--answers", default=None, help="Archivo JSON con respuestas (si no quieres probabilidades)")
     ap.add_argument("--seed", type=int, default=None, help="Semilla para aleatoriedad reproducible")
     ap.add_argument("--slowmo", type=int, default=120, help="Milisegundos de retardo por acción (default 120)")
     ap.add_argument("--headless", action="store_true", help="Ejecuta en modo headless (por defecto visible)")
+    ap.add_argument("--runs", type=int, default=110, help="Número de envíos a realizar (default 110)")
     args = ap.parse_args()
 
     url = args.url or input("Pega la URL del formulario (viewform): ").strip()
@@ -400,19 +405,18 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
+    answers_static = None
     if args.answers:
-        p = Path(args.answers)
-        if not p.exists():
-            alt = input(f"No se encontró '{p}'. Ruta alternativa (o Enter para cancelar): ").strip()
+        pth = Path(args.answers)
+        if not pth.exists():
+            alt = input(f"No se encontró '{pth}'. Ruta alternativa (o Enter para cancelar): ").strip()
             if not alt:
                 print("[bot] No hay archivo de respuestas. Saliendo.")
                 return
-            p = Path(alt)
-        answers = json.loads(p.read_text(encoding="utf-8"))
-    else:
-        answers = build_prob_answers()
+            pth = Path(alt)
+        answers_static = json.loads(pth.read_text(encoding="utf-8"))
 
-    run_bot(url=url, answers=answers, headless=args.headless, slowmo=args.slowmo)
+    run_many(url=url, runs=args.runs, headless=args.headless, slowmo=args.slowmo, answers_static=answers_static)
 
 if __name__ == "__main__":
     main()
